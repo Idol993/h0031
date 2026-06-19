@@ -214,6 +214,8 @@ class ProctorEngine:
         if not state:
             return []
 
+        session_manager.push_frame_to_buffer(session_id, frame)
+
         result = self.detect(frame)
         alerts = []
         now = time.time()
@@ -236,9 +238,11 @@ class ProctorEngine:
                         description=f"画面中无人脸持续 {duration:.1f} 秒"
                     )
                     alerts.append({
+                        "id": alert.id,
                         "type": AlertType.NO_FACE.value,
                         "confidence": alert_confidence,
                         "screenshot": screenshot,
+                        "video_clip": alert.video_clip_path,
                         "needs_review": alert_confidence < self.LOW_CONFIDENCE_THRESHOLD
                     })
                     state.no_face_start_time = 0
@@ -257,9 +261,11 @@ class ProctorEngine:
                 description=f"检测到 {result.face_count} 张人脸"
             )
             alerts.append({
+                "id": alert.id,
                 "type": AlertType.MULTI_FACE.value,
                 "confidence": 0.98,
                 "screenshot": screenshot,
+                "video_clip": alert.video_clip_path,
                 "needs_review": False
             })
 
@@ -275,9 +281,11 @@ class ProctorEngine:
                 description="人脸偏离画面中心"
             )
             alerts.append({
+                "id": alert.id,
                 "type": AlertType.FACE_OFF_CENTER.value,
                 "confidence": 0.85,
                 "screenshot": screenshot,
+                "video_clip": alert.video_clip_path,
                 "needs_review": True
             })
 
@@ -301,9 +309,11 @@ class ProctorEngine:
                         description=f"视线偏离持续 {duration:.1f} 秒，角度 {gaze_magnitude:.1f}°"
                     )
                     alerts.append({
+                        "id": alert.id,
                         "type": AlertType.GAZE_DEVIATION.value,
                         "confidence": alert_confidence,
                         "screenshot": screenshot,
+                        "video_clip": alert.video_clip_path,
                         "needs_review": alert_confidence < self.LOW_CONFIDENCE_THRESHOLD
                     })
                     state.gaze_deviation_start_time = 0
@@ -329,9 +339,11 @@ class ProctorEngine:
                             description=f"疑似人员更换，相似度 {stored_similarity:.3f}"
                         )
                         alerts.append({
+                            "id": alert.id,
                             "type": AlertType.FACE_REPLACEMENT.value,
                             "confidence": alert_confidence,
                             "screenshot": screenshot,
+                            "video_clip": alert.video_clip_path,
                             "needs_review": alert_confidence < self.LOW_CONFIDENCE_THRESHOLD
                         })
 

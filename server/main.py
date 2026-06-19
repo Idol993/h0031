@@ -8,7 +8,7 @@ from datetime import datetime
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -25,7 +25,7 @@ from .session_manager import (
 from .proctor_engine import proctor_engine
 
 
-app = FastAPI(title="在线考试监考系统 API", version="1.0.0")
+app = FastAPI(title="在线考试监考系统 API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -75,6 +75,7 @@ class AlertResponse(BaseModel):
     alert_type: str
     confidence: float
     screenshot_path: Optional[str] = None
+    video_clip_path: Optional[str] = None
     status: str
     timestamp: Optional[str] = None
     description: Optional[str] = None
@@ -100,9 +101,20 @@ class ReportResponse(BaseModel):
     duration_seconds: int
     verify_confidence: float
     total_alerts: int
+    confirmed_cheating: int
+    false_positive: int
+    pending_review: int
     alert_stats: Dict[str, Any]
     overall_confidence_score: float
     timeline: List[Dict[str, Any]]
+
+
+class PaginatedAlertResponse(BaseModel):
+    items: List[Dict[str, Any]]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
 
 
 # ---------- Utility Functions ----------
@@ -120,7 +132,6 @@ def decode_image(image_bytes: bytes) -> Optional[np.ndarray]:
 
 @app.post("/api/students", response_model=StudentResponse)
 async def create_student(student: StudentCreate):
-    """创建考生账户"""
     db_student = session_manager.create_student(student.name, student.student_no)
     return StudentResponse(
         id=db_student.id,
@@ -132,7 +143,6 @@ async def create_student(student: StudentCreate):
 
 @app.post("/api/students/{student_id}/face")
 async def upload_student_face(student_id: str, file: UploadFile = File(...)):
-    """上传考生人脸照片，用于后续身份核验"""
     contents = await file.read()
     img = decode_image(contents)
     if img is None:
@@ -151,7 +161,6 @@ async def upload_student_face(student_id: str, file: UploadFile = File(...)):
 
 @app.get("/api/students/{student_id}", response_model=StudentResponse)
 async def get_student(student_id: str):
-    """获取考生信息"""
     from .session_manager import SessionLocal, Student
     db = SessionLocal()
     try:
@@ -172,7 +181,6 @@ async def get_student(student_id: str):
 
 @app.post("/api/exams", response_model=ExamResponse)
 async def create_exam(exam: ExamCreate):
-    """创建考试会话"""
     session = session_manager.create_exam_session(exam.student_id, exam.exam_name)
     return ExamResponse(
         id=session.id,
@@ -186,7 +194,6 @@ async def create_exam(exam: ExamCreate):
 
 @app.post("/api/exams/{session_id}/verify")
 async def verify_face(session_id: str, file: UploadFile = File(...)):
-    """考前身份核验，通过后开始考试"""
     session = session_manager.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="考试会话不存在")
@@ -218,7 +225,6 @@ async def verify_face(session_id: str, file: UploadFile = File(...)):
 
 @app.post("/api/exams/{session_id}/start")
 async def start_exam(session_id: str):
-    """手动开始考试（跳过人脸验证，用于调试）"""
     session = session_manager.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="考试会话不存在")
@@ -232,7 +238,6 @@ async def start_exam(session_id: str):
 
 @app.post("/api/exams/{session_id}/end")
 async def end_exam(session_id: str):
-    """结束考试"""
     success = session_manager.end_exam(session_id, terminated=False)
     if not success:
         raise HTTPException(status_code=404, detail="考试会话不存在")
@@ -241,7 +246,6 @@ async def end_exam(session_id: str):
 
 @app.get("/api/exams/{session_id}", response_model=ExamResponse)
 async def get_exam(session_id: str):
-    """获取考试会话信息"""
     session = session_manager.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="考试会话不存在")
@@ -259,7 +263,6 @@ async def get_exam(session_id: str):
 
 @app.get("/api/exams", response_model=List[ExamResponse])
 async def list_exams():
-    """获取所有考试会话列表"""
     sessions = session_manager.get_all_sessions()
     return [
         ExamResponse(
@@ -280,7 +283,6 @@ async def list_exams():
 
 @app.get("/api/exams/{session_id}/alerts", response_model=List[AlertResponse])
 async def get_alerts(session_id: str, status: Optional[AlertStatus] = None):
-    """获取考试会话的告警列表"""
     alerts = session_manager.get_alerts(session_id, status)
     return [
         AlertResponse(
@@ -289,6 +291,7 @@ async def get_alerts(session_id: str, status: Optional[AlertStatus] = None):
             alert_type=a.alert_type,
             confidence=a.confidence,
             screenshot_path=a.screenshot_path,
+            video_clip_path=a.video_clip_path,
             status=a.status,
             timestamp=a.timestamp.isoformat() if a.timestamp else None,
             description=a.description
@@ -299,18 +302,46 @@ async def get_alerts(session_id: str, status: Optional[AlertStatus] = None):
 
 @app.put("/api/alerts/{alert_id}/status")
 async def update_alert_status(alert_id: str, update: AlertStatusUpdate):
-    """更新告警状态（标记误报或确认作弊）"""
     success = session_manager.update_alert_status(alert_id, update.status)
     if not success:
         raise HTTPException(status_code=404, detail="告警不存在")
-    return {"success": True, "alert_id": alert_id, "status": update.status.value}
+
+    result = {"success": True, "alert_id": alert_id, "status": update.status.value}
+
+    if update.status == AlertStatus.CONFIRMED_CHEATING:
+        result["message"] = "已确认作弊，考试已终止"
+
+    return result
+
+
+# ---------- Aggregated Alert Query ----------
+
+@app.get("/api/alerts", response_model=PaginatedAlertResponse)
+async def query_alerts(
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(20, ge=1, le=100, description="每页数量"),
+    session_id: Optional[str] = Query(None, description="考试会话ID"),
+    student_id: Optional[str] = Query(None, description="学生ID"),
+    alert_type: Optional[AlertType] = Query(None, description="异常类型"),
+    status: Optional[AlertStatus] = Query(None, description="处理状态"),
+    exam_name: Optional[str] = Query(None, description="考试名称（模糊搜索）")
+):
+    result = session_manager.query_alerts_paginated(
+        page=page,
+        page_size=page_size,
+        session_id=session_id,
+        student_id=student_id,
+        alert_type=alert_type,
+        status=status,
+        exam_name=exam_name
+    )
+    return PaginatedAlertResponse(**result)
 
 
 # ---------- Report Routes ----------
 
 @app.get("/api/exams/{session_id}/report")
 async def get_report(session_id: str):
-    """获取监考报告（JSON格式）"""
     report = session_manager.generate_report(session_id)
     if not report:
         raise HTTPException(status_code=404, detail="考试会话不存在")
@@ -319,13 +350,16 @@ async def get_report(session_id: str):
 
 @app.get("/api/exams/{session_id}/report.pdf")
 async def get_report_pdf(session_id: str):
-    """获取监考报告（PDF格式）"""
     try:
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-        from reportlab.lib.units import inch
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle
+        from reportlab.lib.units import inch, cm
+        from reportlab.platypus import (
+            SimpleDocTemplate, Paragraph, Spacer, Image,
+            Table, TableStyle, PageBreak, HRFlowable
+        )
         from reportlab.lib import colors
+        from reportlab.lib.utils import ImageReader
     except ImportError:
         raise HTTPException(status_code=500, detail="PDF生成库未安装")
 
@@ -358,6 +392,9 @@ async def get_report_pdf(session_id: str):
         ["考试时长(秒)", str(report.get("duration_seconds", 0))],
         ["人脸核验置信度", f"{report.get('verify_confidence', 0):.2%}"],
         ["告警总数", str(report.get("total_alerts", 0))],
+        ["确认作弊", str(report.get("confirmed_cheating", 0))],
+        ["误报", str(report.get("false_positive", 0))],
+        ["待复核", str(report.get("pending_review", 0))],
         ["整体置信度评分", f"{report.get('overall_confidence_score', 0):.2%}"],
     ]
 
@@ -379,7 +416,7 @@ async def get_report_pdf(session_id: str):
 
     alert_stats = report.get("alert_stats", {})
     if alert_stats:
-        stats_data = [["告警类型", "次数", "平均置信度", "确认作弊", "误报"]]
+        stats_data = [["告警类型", "次数", "平均置信度", "确认作弊", "误报", "待复核", "有效异常"]]
         for atype, stats in alert_stats.items():
             stats_data.append([
                 atype,
@@ -387,15 +424,17 @@ async def get_report_pdf(session_id: str):
                 f"{stats.get('avg_confidence', 0):.2%}",
                 str(stats.get("confirmed", 0)),
                 str(stats.get("false_positive", 0)),
+                str(stats.get("pending", 0)),
+                str(stats.get("effective", 0)),
             ])
 
-        stats_table = Table(stats_data, colWidths=[1.5 * inch, 0.8 * inch, 1.2 * inch, 1 * inch, 0.8 * inch])
+        stats_table = Table(stats_data, colWidths=[1.2 * inch, 0.6 * inch, 1 * inch, 0.8 * inch, 0.6 * inch, 0.7 * inch, 0.8 * inch])
         stats_table.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), colors.darkblue),
             ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
             ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
             ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, -1), 9),
+            ('FONTSIZE', (0, 0), (-1, -1), 8),
             ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
             ('GRID', (0, 0), (-1, -1), 1, colors.grey),
         ]))
@@ -404,22 +443,46 @@ async def get_report_pdf(session_id: str):
         story.append(Paragraph("无告警记录", styles['Normal']))
 
     story.append(Spacer(1, 0.3 * inch))
-    story.append(Paragraph("告警时间线", styles['Heading2']))
+    story.append(Paragraph("告警时间线（含留证材料）", styles['Heading2']))
     story.append(Spacer(1, 0.1 * inch))
 
     timeline = report.get("timeline", [])
-    for i, event in enumerate(timeline[:20]):
+    for i, event in enumerate(timeline):
+        status_color = "#FF0000" if event.get("status") == "confirmed_cheating" else (
+            "#999999" if event.get("status") == "false_positive" else "#000000"
+        )
+
         event_text = (
+            f'<font color="{status_color}">'
             f"[{event.get('timestamp', '')}] {event.get('type', '')} - "
             f"置信度: {event.get('confidence', 0):.2%} - "
-            f"状态: {event.get('status', '')}<br/>"
+            f"状态: {event.get('status', '')}"
+            f"</font><br/>"
             f"描述: {event.get('description', '')}"
         )
         story.append(Paragraph(event_text, styles['Normal']))
-        story.append(Spacer(1, 0.05 * inch))
 
-    if len(timeline) > 20:
-        story.append(Paragraph(f"... 还有 {len(timeline) - 20} 条记录", styles['Normal']))
+        screenshot_url = event.get("screenshot")
+        if screenshot_url:
+            local_path = session_manager.get_screenshot_local_path(screenshot_url)
+            if local_path and os.path.exists(local_path):
+                try:
+                    img = Image(local_path, width=3 * inch, height=2.25 * inch)
+                    img.hAlign = 'LEFT'
+                    story.append(img)
+                except Exception:
+                    story.append(Paragraph(f"截图: {screenshot_url}", styles['Normal']))
+            else:
+                story.append(Paragraph(f"截图: {screenshot_url}", styles['Normal']))
+
+        video_clip_url = event.get("video_clip")
+        if video_clip_url:
+            story.append(Paragraph(f"视频片段: {video_clip_url}", styles['Normal']))
+
+        story.append(Spacer(1, 0.15 * inch))
+
+        if i > 0 and i % 5 == 0:
+            story.append(HRFlowable(width="100%", thickness=0.5, color=colors.grey))
 
     doc.build(story)
     buffer.seek(0)
@@ -435,7 +498,6 @@ async def get_report_pdf(session_id: str):
 
 @app.websocket("/ws/proctor/{session_id}")
 async def websocket_proctor(websocket: WebSocket, session_id: str):
-    """WebSocket接收考生摄像头视频流，实时进行监考检测"""
     await websocket.accept()
 
     session = session_manager.get_session(session_id)
@@ -463,6 +525,17 @@ async def websocket_proctor(websocket: WebSocket, session_id: str):
             if not data:
                 continue
 
+            if not session_manager.is_exam_active(session_id):
+                current = session_manager.get_session(session_id)
+                status_msg = current.status if current else "unknown"
+                await websocket.send_json({
+                    "type": "exam_terminated",
+                    "message": f"考试已结束（状态: {status_msg}），拒绝接收视频帧",
+                    "status": status_msg
+                })
+                await websocket.close(code=4003, reason=f"考试已终止: {status_msg}")
+                return
+
             img = decode_image(data)
             if img is None:
                 await websocket.send_json({"type": "error", "message": "无效的帧数据"})
@@ -478,7 +551,6 @@ async def websocket_proctor(websocket: WebSocket, session_id: str):
                 alerts = proctor_engine.process_frame(session_id, img)
 
             result = proctor_engine.detect(img)
-            overlay_frame = proctor_engine.draw_overlay(img, result)
 
             response = {
                 "type": "frame_result",
@@ -507,7 +579,6 @@ async def websocket_proctor(websocket: WebSocket, session_id: str):
 
 @app.get("/sse/alerts/{session_id}")
 async def sse_alerts(session_id: str):
-    """Server-Sent Events 推送告警给监考老师端"""
     session = session_manager.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="考试会话不存在")
@@ -545,7 +616,6 @@ async def sse_alerts(session_id: str):
 
 @app.get("/api/health")
 async def health_check():
-    """健康检查"""
     return {
         "status": "ok",
         "timestamp": datetime.utcnow().isoformat(),

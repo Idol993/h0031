@@ -2,13 +2,15 @@ import os
 import uuid
 import json
 import time
+import threading
+from collections import deque
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
 
 import numpy as np
-from sqlalchemy import create_engine, Column, String, Float, Integer, DateTime, Boolean, Text, ForeignKey
+from sqlalchemy import create_engine, Column, String, Float, Integer, DateTime, Boolean, Text, ForeignKey, or_, and_
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
 
@@ -82,6 +84,7 @@ class AlertEvent(Base):
     alert_type = Column(String, index=True)
     confidence = Column(Float, default=0.0)
     screenshot_path = Column(String, nullable=True)
+    video_clip_path = Column(String, nullable=True)
     status = Column(String, default=AlertStatus.PENDING.value)
     timestamp = Column(DateTime, default=datetime.utcnow)
     description = Column(Text, nullable=True)
@@ -90,6 +93,12 @@ class AlertEvent(Base):
 
 
 Base.metadata.create_all(bind=engine)
+
+
+@dataclass
+class FrameRecord:
+    frame: np.ndarray
+    timestamp: float
 
 
 @dataclass
@@ -102,6 +111,9 @@ class SessionState:
     last_frame_time: float = 0.0
     alert_buffer: List[Dict] = field(default_factory=list)
     sse_clients: List = field(default_factory=list)
+    frame_ring_buffer: deque = field(default_factory=lambda: deque(maxlen=150))
+    post_alert_recording: Optional[Dict] = None
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 class SessionManager:
@@ -195,6 +207,9 @@ class SessionManager:
             db.commit()
 
             if session_id in self._active_sessions:
+                state = self._active_sessions[session_id]
+                if state.post_alert_recording:
+                    self._flush_post_alert_clip(session_id, state)
                 del self._active_sessions[session_id]
             return True
         finally:
@@ -210,6 +225,73 @@ class SessionManager:
     def get_session_state(self, session_id: str) -> Optional[SessionState]:
         return self._active_sessions.get(session_id)
 
+    def is_exam_active(self, session_id: str) -> bool:
+        session = self.get_session(session_id)
+        if not session:
+            return False
+        return session.status == ExamStatus.IN_PROGRESS.value
+
+    def push_frame_to_buffer(self, session_id: str, frame: np.ndarray) -> None:
+        state = self._active_sessions.get(session_id)
+        if not state:
+            return
+        with state.lock:
+            state.frame_ring_buffer.append(FrameRecord(frame=frame.copy(), timestamp=time.time()))
+            if state.post_alert_recording is not None:
+                state.post_alert_recording["frames"].append(FrameRecord(frame=frame.copy(), timestamp=time.time()))
+                elapsed = time.time() - state.post_alert_recording["start_time"]
+                if elapsed >= state.post_alert_recording["duration"]:
+                    self._flush_post_alert_clip(session_id, state)
+
+    def _flush_post_alert_clip(self, session_id: str, state: SessionState) -> None:
+        if state.post_alert_recording is None:
+            return
+        recording = state.post_alert_recording
+        state.post_alert_recording = None
+
+        all_frames = recording.get("pre_frames", []) + recording["frames"]
+        if not all_frames:
+            return
+
+        video_path = self._write_video_clip(
+            session_id, all_frames, recording["alert_type"], recording["alert_ts"]
+        )
+
+        if video_path and recording.get("alert_id"):
+            db = SessionLocal()
+            try:
+                alert = db.query(AlertEvent).filter(AlertEvent.id == recording["alert_id"]).first()
+                if alert:
+                    alert.video_clip_path = video_path
+                    db.commit()
+            finally:
+                db.close()
+
+    def _write_video_clip(self, session_id: str, frames: List[FrameRecord],
+                          alert_type: str, alert_ts: int) -> Optional[str]:
+        import cv2
+        if not frames:
+            return None
+
+        filename = f"{session_id}_{alert_type}_{alert_ts}.avi"
+        filepath = os.path.join(ALERTS_DIR, filename)
+
+        h, w = frames[0].frame.shape[:2]
+        fourcc = cv2.VideoWriter_fourcc(*'XVID')
+        fps = 10.0
+        if len(frames) > 1:
+            duration = frames[-1].timestamp - frames[0].timestamp
+            if duration > 0:
+                fps = len(frames) / duration
+                fps = max(5.0, min(30.0, fps))
+
+        writer = cv2.VideoWriter(filepath, fourcc, fps, (w, h))
+        for rec in frames:
+            writer.write(rec.frame)
+        writer.release()
+
+        return f"/alerts/{filename}"
+
     def add_alert(self, session_id: str, alert_type: AlertType, confidence: float,
                   screenshot_path: Optional[str] = None, description: Optional[str] = None) -> AlertEvent:
         db = SessionLocal()
@@ -220,6 +302,7 @@ class SessionManager:
                 alert_type=alert_type.value,
                 confidence=confidence,
                 screenshot_path=screenshot_path,
+                video_clip_path=None,
                 status=AlertStatus.PENDING.value,
                 description=description or ""
             )
@@ -231,6 +314,20 @@ class SessionManager:
 
             db.commit()
             db.refresh(alert)
+
+            state = self._active_sessions.get(session_id)
+            if state:
+                with state.lock:
+                    pre_frames = list(state.frame_ring_buffer)
+                    state.post_alert_recording = {
+                        "alert_id": alert.id,
+                        "alert_type": alert_type.value,
+                        "alert_ts": int(time.time() * 1000),
+                        "start_time": time.time(),
+                        "duration": 3.0,
+                        "pre_frames": pre_frames,
+                        "frames": []
+                    }
 
             self._push_sse_alert(session_id, alert)
             return alert
@@ -250,8 +347,12 @@ class SessionManager:
                 if session and session.status == ExamStatus.IN_PROGRESS.value:
                     session.status = ExamStatus.TERMINATED.value
                     session.end_time = datetime.utcnow()
-                    if alert.session_id in self._active_sessions:
-                        del self._active_sessions[alert.session_id]
+                    sid = alert.session_id
+                    if sid in self._active_sessions:
+                        state = self._active_sessions[sid]
+                        if state.post_alert_recording:
+                            self._flush_post_alert_clip(sid, state)
+                        del self._active_sessions[sid]
 
             db.commit()
             return True
@@ -275,6 +376,67 @@ class SessionManager:
         finally:
             db.close()
 
+    def query_alerts_paginated(
+        self,
+        page: int = 1,
+        page_size: int = 20,
+        session_id: Optional[str] = None,
+        student_id: Optional[str] = None,
+        alert_type: Optional[AlertType] = None,
+        status: Optional[AlertStatus] = None,
+        exam_name: Optional[str] = None
+    ) -> Dict:
+        db = SessionLocal()
+        try:
+            query = db.query(AlertEvent).join(AlertEvent.exam_session).join(ExamSession.student)
+
+            if session_id:
+                query = query.filter(AlertEvent.session_id == session_id)
+            if student_id:
+                query = query.filter(ExamSession.student_id == student_id)
+            if alert_type:
+                query = query.filter(AlertEvent.alert_type == alert_type.value)
+            if status:
+                query = query.filter(AlertEvent.status == status.value)
+            if exam_name:
+                query = query.filter(ExamSession.exam_name.contains(exam_name))
+
+            total = query.count()
+            total_pages = max(1, (total + page_size - 1) // page_size)
+            offset = (page - 1) * page_size
+
+            alerts = query.order_by(AlertEvent.timestamp.desc()).offset(offset).limit(page_size).all()
+
+            items = []
+            for a in alerts:
+                exam = a.exam_session
+                student = exam.student if exam else None
+                items.append({
+                    "id": a.id,
+                    "session_id": a.session_id,
+                    "alert_type": a.alert_type,
+                    "confidence": a.confidence,
+                    "screenshot_path": a.screenshot_path,
+                    "video_clip_path": a.video_clip_path,
+                    "status": a.status,
+                    "timestamp": a.timestamp.isoformat() if a.timestamp else None,
+                    "description": a.description,
+                    "exam_name": exam.exam_name if exam else None,
+                    "student_id": exam.student_id if exam else None,
+                    "student_name": student.name if student else None,
+                    "student_no": student.student_no if student else None,
+                })
+
+            return {
+                "items": items,
+                "total": total,
+                "page": page,
+                "page_size": page_size,
+                "total_pages": total_pages
+            }
+        finally:
+            db.close()
+
     def generate_report(self, session_id: str) -> Dict:
         db = SessionLocal()
         try:
@@ -290,19 +452,28 @@ class SessionManager:
             for alert in alerts:
                 atype = alert.alert_type
                 if atype not in alert_stats:
-                    alert_stats[atype] = {"count": 0, "avg_confidence": 0.0, "confirmed": 0, "false_positive": 0}
+                    alert_stats[atype] = {
+                        "count": 0,
+                        "avg_confidence": 0.0,
+                        "confirmed": 0,
+                        "false_positive": 0,
+                        "pending": 0,
+                        "effective": 0
+                    }
                 alert_stats[atype]["count"] += 1
                 alert_stats[atype]["avg_confidence"] += alert.confidence
                 if alert.status == AlertStatus.CONFIRMED_CHEATING.value:
                     alert_stats[atype]["confirmed"] += 1
                 elif alert.status == AlertStatus.FALSE_POSITIVE.value:
                     alert_stats[atype]["false_positive"] += 1
+                elif alert.status == AlertStatus.PENDING.value:
+                    alert_stats[atype]["pending"] += 1
 
             for k in alert_stats:
-                if alert_stats[k]["count"] > 0:
-                    alert_stats[k]["avg_confidence"] = round(
-                        alert_stats[k]["avg_confidence"] / alert_stats[k]["count"], 4
-                    )
+                s = alert_stats[k]
+                if s["count"] > 0:
+                    s["avg_confidence"] = round(s["avg_confidence"] / s["count"], 4)
+                s["effective"] = s["confirmed"] + s["pending"]
 
             timeline = []
             for alert in alerts:
@@ -312,9 +483,14 @@ class SessionManager:
                     "confidence": alert.confidence,
                     "timestamp": alert.timestamp.isoformat() if alert.timestamp else None,
                     "screenshot": alert.screenshot_path,
+                    "video_clip": alert.video_clip_path,
                     "status": alert.status,
                     "description": alert.description
                 })
+
+            confirmed_count = sum(1 for a in alerts if a.status == AlertStatus.CONFIRMED_CHEATING.value)
+            false_positive_count = sum(1 for a in alerts if a.status == AlertStatus.FALSE_POSITIVE.value)
+            pending_count = sum(1 for a in alerts if a.status == AlertStatus.PENDING.value)
 
             overall_confidence = 0.0
             if alert_stats:
@@ -337,6 +513,9 @@ class SessionManager:
                 "duration_seconds": duration_seconds,
                 "verify_confidence": session.verify_confidence,
                 "total_alerts": session.total_alerts,
+                "confirmed_cheating": confirmed_count,
+                "false_positive": false_positive_count,
+                "pending_review": pending_count,
                 "alert_stats": alert_stats,
                 "overall_confidence_score": round(overall_confidence, 4),
                 "timeline": timeline
@@ -364,6 +543,7 @@ class SessionManager:
             "confidence": alert.confidence,
             "timestamp": alert.timestamp.isoformat() if alert.timestamp else None,
             "screenshot": alert.screenshot_path,
+            "video_clip": alert.video_clip_path,
             "status": alert.status,
             "description": alert.description
         }
@@ -380,6 +560,13 @@ class SessionManager:
         filepath = os.path.join(ALERTS_DIR, filename)
         cv2.imwrite(filepath, frame)
         return f"/alerts/{filename}"
+
+    def get_screenshot_local_path(self, url_path: str) -> Optional[str]:
+        if not url_path:
+            return None
+        filename = url_path.replace("/alerts/", "")
+        local = os.path.join(ALERTS_DIR, filename)
+        return local if os.path.exists(local) else None
 
 
 session_manager = SessionManager()
