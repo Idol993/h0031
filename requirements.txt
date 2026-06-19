@@ -1,0 +1,9 @@
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+opencv-python==4.8.1.78
+mediapipe==0.10.9
+pydantic==2.5.3
+sqlalchemy==2.0.25
+numpy==1.26.3
+python-multipart==0.0.6
+reportlab==4.0.9
