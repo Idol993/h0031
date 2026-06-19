@@ -39,6 +39,13 @@ class AlertStatus(str, Enum):
     CONFIRMED_CHEATING = "confirmed_cheating"
 
 
+class VideoStatus(str, Enum):
+    NONE = "none"
+    GENERATING = "generating"
+    READY = "ready"
+    FAILED = "failed"
+
+
 class ExamStatus(str, Enum):
     NOT_STARTED = "not_started"
     VERIFYING = "verifying"
@@ -85,6 +92,7 @@ class AlertEvent(Base):
     confidence = Column(Float, default=0.0)
     screenshot_path = Column(String, nullable=True)
     video_clip_path = Column(String, nullable=True)
+    video_status = Column(String, nullable=True)
     status = Column(String, default=AlertStatus.PENDING.value)
     timestamp = Column(DateTime, default=datetime.utcnow)
     description = Column(Text, nullable=True)
@@ -92,7 +100,53 @@ class AlertEvent(Base):
     exam_session = relationship("ExamSession", back_populates="alerts")
 
 
+def _pragmas_to_dict(rows):
+    return {row[1]: row for row in rows}
+
+
+def _migrate_database():
+    with engine.connect() as conn:
+        result = conn.exec_driver_sql("PRAGMA table_info(alert_events)").fetchall()
+        cols = _pragmas_to_dict(result)
+        existing = set(cols.keys())
+
+        if "video_clip_path" not in existing:
+            try:
+                conn.exec_driver_sql(
+                    "ALTER TABLE alert_events ADD COLUMN video_clip_path TEXT"
+                )
+                conn.commit()
+            except Exception:
+                pass
+
+        if "video_status" not in existing:
+            try:
+                conn.exec_driver_sql(
+                    "ALTER TABLE alert_events ADD COLUMN video_status TEXT"
+                )
+                conn.commit()
+            except Exception:
+                pass
+
+        if "video_status" in existing or True:
+            try:
+                conn.exec_driver_sql(
+                    "UPDATE alert_events SET video_status = 'ready' WHERE video_status IS NULL AND video_clip_path IS NOT NULL AND video_clip_path != ''"
+                )
+                conn.commit()
+            except Exception:
+                pass
+            try:
+                conn.exec_driver_sql(
+                    "UPDATE alert_events SET video_status = 'none' WHERE video_status IS NULL OR video_status = ''"
+                )
+                conn.commit()
+            except Exception:
+                pass
+
+
 Base.metadata.create_all(bind=engine)
+_migrate_database()
 
 
 @dataclass
@@ -112,7 +166,7 @@ class SessionState:
     alert_buffer: List[Dict] = field(default_factory=list)
     sse_clients: List = field(default_factory=list)
     frame_ring_buffer: deque = field(default_factory=lambda: deque(maxlen=150))
-    post_alert_recording: Optional[Dict] = None
+    post_alert_recordings: List[Dict] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -207,9 +261,7 @@ class SessionManager:
             db.commit()
 
             if session_id in self._active_sessions:
-                state = self._active_sessions[session_id]
-                if state.post_alert_recording:
-                    self._flush_post_alert_clip(session_id, state)
+                self.flush_all_pending_recordings(session_id)
                 del self._active_sessions[session_id]
             return True
         finally:
@@ -236,33 +288,53 @@ class SessionManager:
         if not state:
             return
         with state.lock:
-            state.frame_ring_buffer.append(FrameRecord(frame=frame.copy(), timestamp=time.time()))
-            if state.post_alert_recording is not None:
-                state.post_alert_recording["frames"].append(FrameRecord(frame=frame.copy(), timestamp=time.time()))
-                elapsed = time.time() - state.post_alert_recording["start_time"]
-                if elapsed >= state.post_alert_recording["duration"]:
-                    self._flush_post_alert_clip(session_id, state)
+            rec = FrameRecord(frame=frame.copy(), timestamp=time.time())
+            state.frame_ring_buffer.append(rec)
+            for i in range(len(state.post_alert_recordings) - 1, -1, -1):
+                recording = state.post_alert_recordings[i]
+                recording["frames"].append(FrameRecord(frame=frame.copy(), timestamp=time.time()))
+                elapsed = time.time() - recording["start_time"]
+                if elapsed >= recording["duration"]:
+                    self._flush_single_alert_clip_locked(session_id, state, recording)
+                    state.post_alert_recordings.pop(i)
 
-    def _flush_post_alert_clip(self, session_id: str, state: SessionState) -> None:
-        if state.post_alert_recording is None:
+    def flush_all_pending_recordings(self, session_id: str) -> None:
+        state = self._active_sessions.get(session_id)
+        if not state:
             return
-        recording = state.post_alert_recording
-        state.post_alert_recording = None
+        with state.lock:
+            for recording in list(state.post_alert_recordings):
+                try:
+                    self._flush_single_alert_clip_locked(session_id, state, recording)
+                except Exception:
+                    pass
+            state.post_alert_recordings.clear()
 
+    def _flush_single_alert_clip_locked(self, session_id: str, state: SessionState, recording: Dict) -> None:
         all_frames = recording.get("pre_frames", []) + recording["frames"]
-        if not all_frames:
-            return
+        video_path = None
+        video_status = VideoStatus.FAILED.value
+        if all_frames:
+            try:
+                video_path = self._write_video_clip(
+                    session_id, all_frames, recording["alert_type"], recording["alert_ts"]
+                )
+                if video_path:
+                    video_status = VideoStatus.READY.value
+            except Exception:
+                video_path = None
+                video_status = VideoStatus.FAILED.value
+        else:
+            video_status = VideoStatus.NONE.value
 
-        video_path = self._write_video_clip(
-            session_id, all_frames, recording["alert_type"], recording["alert_ts"]
-        )
-
-        if video_path and recording.get("alert_id"):
+        if recording.get("alert_id"):
             db = SessionLocal()
             try:
                 alert = db.query(AlertEvent).filter(AlertEvent.id == recording["alert_id"]).first()
                 if alert:
-                    alert.video_clip_path = video_path
+                    if video_path:
+                        alert.video_clip_path = video_path
+                    alert.video_status = video_status
                     db.commit()
             finally:
                 db.close()
@@ -286,6 +358,8 @@ class SessionManager:
                 fps = max(5.0, min(30.0, fps))
 
         writer = cv2.VideoWriter(filepath, fourcc, fps, (w, h))
+        if not writer.isOpened():
+            return None
         for rec in frames:
             writer.write(rec.frame)
         writer.release()
@@ -303,6 +377,7 @@ class SessionManager:
                 confidence=confidence,
                 screenshot_path=screenshot_path,
                 video_clip_path=None,
+                video_status=VideoStatus.GENERATING.value,
                 status=AlertStatus.PENDING.value,
                 description=description or ""
             )
@@ -319,7 +394,7 @@ class SessionManager:
             if state:
                 with state.lock:
                     pre_frames = list(state.frame_ring_buffer)
-                    state.post_alert_recording = {
+                    recording = {
                         "alert_id": alert.id,
                         "alert_type": alert_type.value,
                         "alert_ts": int(time.time() * 1000),
@@ -328,6 +403,7 @@ class SessionManager:
                         "pre_frames": pre_frames,
                         "frames": []
                     }
+                    state.post_alert_recordings.append(recording)
 
             self._push_sse_alert(session_id, alert)
             return alert
@@ -348,16 +424,24 @@ class SessionManager:
                     session.status = ExamStatus.TERMINATED.value
                     session.end_time = datetime.utcnow()
                     sid = alert.session_id
+                    db.commit()
                     if sid in self._active_sessions:
-                        state = self._active_sessions[sid]
-                        if state.post_alert_recording:
-                            self._flush_post_alert_clip(sid, state)
+                        self.flush_all_pending_recordings(sid)
                         del self._active_sessions[sid]
+                    return True
 
             db.commit()
             return True
         finally:
             db.close()
+
+    def _normalize_video_status(self, obj: AlertEvent) -> str:
+        vs = obj.video_status
+        if vs:
+            return vs
+        if obj.video_clip_path:
+            return VideoStatus.READY.value
+        return VideoStatus.NONE.value
 
     def get_alerts(self, session_id: str, status: Optional[AlertStatus] = None) -> List[AlertEvent]:
         db = SessionLocal()
@@ -365,7 +449,10 @@ class SessionManager:
             query = db.query(AlertEvent).filter(AlertEvent.session_id == session_id)
             if status:
                 query = query.filter(AlertEvent.status == status.value)
-            return query.order_by(AlertEvent.timestamp.desc()).all()
+            result = query.order_by(AlertEvent.timestamp.desc()).all()
+            for r in result:
+                r.video_status = self._normalize_video_status(r)
+            return result
         finally:
             db.close()
 
@@ -411,6 +498,7 @@ class SessionManager:
             for a in alerts:
                 exam = a.exam_session
                 student = exam.student if exam else None
+                video_status = self._normalize_video_status(a)
                 items.append({
                     "id": a.id,
                     "session_id": a.session_id,
@@ -418,6 +506,7 @@ class SessionManager:
                     "confidence": a.confidence,
                     "screenshot_path": a.screenshot_path,
                     "video_clip_path": a.video_clip_path,
+                    "video_status": video_status,
                     "status": a.status,
                     "timestamp": a.timestamp.isoformat() if a.timestamp else None,
                     "description": a.description,
@@ -477,6 +566,7 @@ class SessionManager:
 
             timeline = []
             for alert in alerts:
+                video_status = self._normalize_video_status(alert)
                 timeline.append({
                     "id": alert.id,
                     "type": alert.alert_type,
@@ -484,6 +574,7 @@ class SessionManager:
                     "timestamp": alert.timestamp.isoformat() if alert.timestamp else None,
                     "screenshot": alert.screenshot_path,
                     "video_clip": alert.video_clip_path,
+                    "video_status": video_status,
                     "status": alert.status,
                     "description": alert.description
                 })
@@ -537,6 +628,7 @@ class SessionManager:
 
     def _push_sse_alert(self, session_id: str, alert: AlertEvent) -> None:
         callbacks = self._sse_callbacks.get(session_id, [])
+        video_status = self._normalize_video_status(alert)
         alert_data = {
             "id": alert.id,
             "type": alert.alert_type,
@@ -544,6 +636,7 @@ class SessionManager:
             "timestamp": alert.timestamp.isoformat() if alert.timestamp else None,
             "screenshot": alert.screenshot_path,
             "video_clip": alert.video_clip_path,
+            "video_status": video_status,
             "status": alert.status,
             "description": alert.description
         }

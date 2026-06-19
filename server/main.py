@@ -18,6 +18,7 @@ from .session_manager import (
     session_manager,
     AlertType,
     AlertStatus,
+    VideoStatus,
     ExamStatus,
     ALERTS_DIR,
     BASE_DIR
@@ -76,6 +77,7 @@ class AlertResponse(BaseModel):
     confidence: float
     screenshot_path: Optional[str] = None
     video_clip_path: Optional[str] = None
+    video_status: str
     status: str
     timestamp: Optional[str] = None
     description: Optional[str] = None
@@ -292,6 +294,7 @@ async def get_alerts(session_id: str, status: Optional[AlertStatus] = None):
             confidence=a.confidence,
             screenshot_path=a.screenshot_path,
             video_clip_path=a.video_clip_path,
+            video_status=a.video_status,
             status=a.status,
             timestamp=a.timestamp.isoformat() if a.timestamp else None,
             description=a.description
@@ -476,8 +479,19 @@ async def get_report_pdf(session_id: str):
                 story.append(Paragraph(f"截图: {screenshot_url}", styles['Normal']))
 
         video_clip_url = event.get("video_clip")
+        video_status = event.get("video_status", VideoStatus.NONE.value)
+        status_label_map = {
+            VideoStatus.READY.value: "✅ 视频片段 (已生成)",
+            VideoStatus.GENERATING.value: "⏳ 视频片段 (生成中，稍后查看)",
+            VideoStatus.FAILED.value: "❌ 视频片段 (生成失败)",
+            VideoStatus.NONE.value: "⚠ 无视频片段",
+        }
+        video_label = status_label_map.get(video_status, f"视频状态: {video_status}")
+
         if video_clip_url:
-            story.append(Paragraph(f"视频片段: {video_clip_url}", styles['Normal']))
+            story.append(Paragraph(f"{video_label}: {video_clip_url}", styles['Normal']))
+        else:
+            story.append(Paragraph(video_label, styles['Normal']))
 
         story.append(Spacer(1, 0.15 * inch))
 
@@ -571,6 +585,11 @@ async def websocket_proctor(websocket: WebSocket, session_id: str):
     except Exception as e:
         try:
             await websocket.close(code=4000, reason=str(e))
+        except Exception:
+            pass
+    finally:
+        try:
+            session_manager.flush_all_pending_recordings(session_id)
         except Exception:
             pass
 

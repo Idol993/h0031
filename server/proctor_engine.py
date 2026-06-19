@@ -243,6 +243,7 @@ class ProctorEngine:
                         "confidence": alert_confidence,
                         "screenshot": screenshot,
                         "video_clip": alert.video_clip_path,
+                        "video_status": alert.video_status,
                         "needs_review": alert_confidence < self.LOW_CONFIDENCE_THRESHOLD
                     })
                     state.no_face_start_time = 0
@@ -266,6 +267,7 @@ class ProctorEngine:
                 "confidence": 0.98,
                 "screenshot": screenshot,
                 "video_clip": alert.video_clip_path,
+                "video_status": alert.video_status,
                 "needs_review": False
             })
 
@@ -286,6 +288,7 @@ class ProctorEngine:
                 "confidence": 0.85,
                 "screenshot": screenshot,
                 "video_clip": alert.video_clip_path,
+                "video_status": alert.video_status,
                 "needs_review": True
             })
 
@@ -314,6 +317,7 @@ class ProctorEngine:
                         "confidence": alert_confidence,
                         "screenshot": screenshot,
                         "video_clip": alert.video_clip_path,
+                        "video_status": alert.video_status,
                         "needs_review": alert_confidence < self.LOW_CONFIDENCE_THRESHOLD
                     })
                     state.gaze_deviation_start_time = 0
@@ -344,6 +348,7 @@ class ProctorEngine:
                             "confidence": alert_confidence,
                             "screenshot": screenshot,
                             "video_clip": alert.video_clip_path,
+                            "video_status": alert.video_status,
                             "needs_review": alert_confidence < self.LOW_CONFIDENCE_THRESHOLD
                         })
 
